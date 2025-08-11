@@ -83,7 +83,7 @@ int32_t ADS1232_Read(void) {
     return (int32_t)data;
 }
 
-void ADS1232_Tare(void) {
+int32_t ADS1232_Tare(void) { 
     printf("Tarando... Aguarde estabilidade.\r\n");
 
     const int num_samples_for_stability = 20; // Número de amostras para checar estabilidade
@@ -116,7 +116,7 @@ void ADS1232_Tare(void) {
         if (stable_count >= 2) {
             adc_offset = sum / num_samples_for_stability;
             printf("Tara estavel concluida! Offset = %ld\r\n", (long)adc_offset);
-            return; // Sai da função
+            return adc_offset; 
         }
         
         printf("Leituras instaveis (diff: %ld). Tentando novamente...\r\n", (long)(max_val - min_val));
@@ -130,6 +130,7 @@ void ADS1232_Tare(void) {
     }
     adc_offset = last_sum / num_samples_for_stability;
     printf("Tara concluida! Offset = %ld\r\n", (long)adc_offset);
+		return adc_offset;
 }
 
 void ADS1232_SetCalibrationFactor(float factor) {
@@ -145,4 +146,8 @@ float ADS1232_ConvertToGrams(int32_t raw_value) {
 
 int32_t ADS1232_GetOffset(void) {
     return adc_offset;
+}
+
+void ADS1232_SetOffset(int32_t new_offset) {
+    adc_offset = new_offset;
 }

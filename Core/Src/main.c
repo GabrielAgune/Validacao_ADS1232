@@ -12,7 +12,8 @@
 #include "gpio.h"
 #include "ads1232_driver.h"
 #include <stdio.h>
-#include <stdlib.h> // Necessário para a função abs()
+#include <stdlib.h>
+#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -36,15 +37,20 @@
 /* Private variables ---------------------------------------------------------*/
 
 // --- VARIÁVEIS PARA O FILTRO EMA ADAPTATIVO ---
-const float alpha_slow = 0.02f; // Alpha para alta estabilidade (quando o peso está parado)
-const float alpha_fast = 0.4f;  // Alpha para resposta rápida (quando o peso muda)
-const int32_t change_threshold = 500; // Limiar (em unidades do ADC) para detectar uma mudança de peso.
+const float alpha_slow = 0.12f; // Alpha para alta estabilidade
+const float alpha_fast = 0.5f;  // Alpha para resposta rápida
+const int32_t change_threshold = 400; // Limiar para detectar mudança de peso
 
 float smoothed_value_ema = 0.0f;
-int first_reading = 1; // Flag para inicializar o filtro na primeira leitura
+int first_reading = 1;
+
+// --- VARIÁVEIS PARA O RASTREAMENTO AUTOMÁTICO DE ZERO ---
+const float auto_zero_threshold_grams = 0.2f;
+const uint32_t auto_zero_time_ms = 3000; // 3 segundos
+uint32_t near_zero_start_time = 0;
+uint8_t is_near_zero = 0;
 
 /* USER CODE BEGIN PV */
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,9 +62,6 @@ void DWIN_SendData(uint16_t vp_address, int32_t value);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/**
-  * @brief  Redireciona o printf para a UART2 (Debug).
-  */
 #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
 
 PUTCHAR_PROTOTYPE
@@ -67,35 +70,21 @@ PUTCHAR_PROTOTYPE
   return ch;
 }
 
-/**
-  * @brief  Envia um valor inteiro de 32 bits para um endereço VP específico no display DWIN.
-  * @param  vp_address: O endereço do Variable Pointer (VP) no display.
-  * @param  value: O valor de 32 bits a ser enviado.
-  */
 void DWIN_SendData(uint16_t vp_address, int32_t value)
 {
-    // Frame DWIN: 5A A5 | Len | 82 | VP_H | VP_L | VAL_B3 | VAL_B2 | VAL_B1 | VAL_B0
     uint8_t dwin_frame[10];
-    
     dwin_frame[0] = 0x5A;
     dwin_frame[1] = 0xA5;
-    dwin_frame[2] = 0x07; // Comprimento: 1(cmd) + 2(vp) + 4(valor) = 7 bytes
-    dwin_frame[3] = 0x82; // Comando de escrita no VP
-    
-    // Endereço VP (Big Endian)
+    dwin_frame[2] = 0x07;
+    dwin_frame[3] = 0x82;
     dwin_frame[4] = (uint8_t)(vp_address >> 8);
     dwin_frame[5] = (uint8_t)(vp_address);
-    
-    // Valor 32-bit (Big Endian)
     dwin_frame[6] = (uint8_t)(value >> 24);
     dwin_frame[7] = (uint8_t)(value >> 16);
     dwin_frame[8] = (uint8_t)(value >> 8);
     dwin_frame[9] = (uint8_t)(value);
-
-    // Envia o frame pela USART1, que deve estar conectada ao display
     HAL_UART_Transmit(&huart1, dwin_frame, 10, 100);
 }
-
 
 /* USER CODE END 0 */
 
@@ -110,10 +99,9 @@ int main(void)
   SystemClock_Config();
   MX_GPIO_Init();
   MX_USART2_UART_Init();
-  MX_USART1_UART_Init(); // USART1 para o Display DWIN
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  // Variáveis para controle do botão (polling e debounce)
   GPIO_PinState button_state = GPIO_PIN_SET;
   GPIO_PinState last_button_state = GPIO_PIN_SET;
   uint32_t last_debounce_time = 0;
@@ -125,14 +113,15 @@ int main(void)
   printf("Aguardando estabilizacao do ADC...\r\n");
   HAL_Delay(120); 
 
-  ADS1232_Read(); // Leitura inicial para limpar buffer
+  ADS1232_Read();
 
-  ADS1232_Tare(); 
+  // Força o filtro a inicializar com o primeiro valor de tara
+  smoothed_value_ema = (float)ADS1232_Tare(); 
+  first_reading = 0;
 	
   printf("\r\nSistema pronto. Balanca vazia e tarada.\r\n");
   
-  // Fator de calibração previamente calculado
-  ADS1232_SetCalibrationFactor(6210); 
+  ADS1232_SetCalibrationFactor(6208.51f); 
 	
   printf("Driver DWIN Inicializado na USART1.\r\n");
 	
@@ -144,19 +133,21 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      // --- LÓGICA DE LEITURA DO BOTÃO (POLLING & DEBOUNCE) ---
+      // --- LÓGICA DE LEITURA DO BOTÃO (POLLING & DEBOUNCE) - CORRIGIDA ---
       GPIO_PinState current_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
 
+      // Esta linha é crucial para o debounce funcionar
       if (current_state != last_button_state) {
           last_debounce_time = HAL_GetTick();
       }
 
-      if ((HAL_GetTick() - last_debounce_time) > 50) { // Debounce de 50ms
+      if ((HAL_GetTick() - last_debounce_time) > 50) { 
           if (current_state != button_state) {
               button_state = current_state;
               if (button_state == GPIO_PIN_RESET) { // Botão foi pressionado
-                  ADS1232_Tare(); // Executa a tara imediatamente
-                  first_reading = 1; // Reinicia o filtro EMA após a tara
+                  int32_t new_offset = ADS1232_Tare(); 
+                  smoothed_value_ema = (float)new_offset;
+                  first_reading = 0;
               }
           }
       }
@@ -165,38 +156,47 @@ int main(void)
 
 
       // --- LÓGICA DE LEITURA, FILTRO E ENVIO DIRETO ---
-      // Roda sempre que o ADC tem um novo dado pronto (DRDY/DOUT em nível baixo). [cite: 1127]
       if (HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_RESET)
       {
-          // 1. LÊ o valor bruto do ADC
           raw_value = ADS1232_Read();
 
-          // 2. APLICA o filtro adaptativo
           if (first_reading) {
               smoothed_value_ema = (float)raw_value;
               first_reading = 0;
           } else {
               int32_t diff = abs((int32_t)raw_value - (int32_t)smoothed_value_ema);
-
               if (diff > change_threshold) {
-                  // Mudança grande detectada: usa o filtro RÁPIDO para convergir rapidamente
                   smoothed_value_ema = (alpha_fast * (float)raw_value) + ((1.0f - alpha_fast) * smoothed_value_ema);
               } else {
-                  // Leitura estável: usa o filtro LENTO para máxima estabilidade
                   smoothed_value_ema = (alpha_slow * (float)raw_value) + ((1.0f - alpha_slow) * smoothed_value_ema);
               }
           }
-
-          // 3. CONVERTE o valor filtrado para gramas
+          
           weight_in_grams = ADS1232_ConvertToGrams((int32_t)smoothed_value_ema);
           
-          // 4. PREPARA o valor para o display
-          int32_t weight_for_dwin = (int32_t)(weight_in_grams * 100.0f);
+          if (fabsf(weight_in_grams) < 0.015f || weight_in_grams < 0.0f) {
+              weight_in_grams = 0.0f;
+          }
           
-          // 5. ENVIA o novo valor para o display IMEDIATAMENTE
-          DWIN_SendData(0x2000, weight_for_dwin);
+          if (fabsf(weight_in_grams) < auto_zero_threshold_grams) {
+              if (is_near_zero == 0) {
+                  is_near_zero = 1;
+                  near_zero_start_time = HAL_GetTick();
+              } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
+                  int32_t new_offset = (int32_t)smoothed_value_ema;
+                  ADS1232_SetOffset(new_offset);
+                  near_zero_start_time = HAL_GetTick();
+              }
+          } else {
+              is_near_zero = 0;
+          }
+					
+					printf("Peso: %.3f\n\r", weight_in_grams);
+					
+          int32_t weight_for_dwin = (int32_t)(weight_in_grams * 1000.0f);
+          
+          DWIN_SendData(0x2000, weight_for_dwin); // VP 0x2000 conforme seu código
 
-          // 6. Pisca o LED para indicar atividade
           HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
       }
     /* USER CODE END WHILE */

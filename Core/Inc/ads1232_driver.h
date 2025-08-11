@@ -13,7 +13,7 @@ void ADS1232_Init(void);
 /**
   * @brief Executa o procedimento de tara, zerando a medição atual.
   */
-void ADS1232_Tare(void);
+int32_t ADS1232_Tare(void);
 
 /**
   * @brief Lê o valor raw de 24 bits do ADC (leitura única e direta).
@@ -38,5 +38,7 @@ float ADS1232_ConvertToGrams(int32_t raw_value);
   * @retval O valor do offset.
   */
 int32_t ADS1232_GetOffset(void);
+
+void ADS1232_SetOffset(int32_t new_offset);
 
 #endif /* INC_ADS1232_DRIVER_H_ */
