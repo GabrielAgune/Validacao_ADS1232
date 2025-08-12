@@ -28,7 +28,17 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* USER CODE END PD */
+typedef enum {
+    STATE_TRANSITION,  // O peso está mudando rapidamente
+    STATE_STABILIZING, // A mudança parou, aguardando confirmação
+    STATE_LOCKED       // A leitura está estável e o valor travado
+} ScaleState_t;
 
+ScaleState_t scale_state = STATE_TRANSITION; // Estado inicial
+float locked_weight_grams = 0.0f;            // Variável para armazenar o peso travado
+uint32_t stabilizing_start_time = 0;         // Timer para o tempo de estabilização
+// Tempo em ms que o peso precisa ficar estável para travar (ex: 1.5 segundos)
+const uint32_t time_to_lock_ms = 2000;     
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
@@ -37,16 +47,16 @@
 /* Private variables ---------------------------------------------------------*/
 
 // --- VARIÁVEIS PARA O FILTRO EMA ADAPTATIVO ---
-const float alpha_slow = 0.12f; // Alpha para alta estabilidade
+const float alpha_slow = 0.2f; // Alpha para alta estabilidade
 const float alpha_fast = 0.5f;  // Alpha para resposta rápida
-const int32_t change_threshold = 400; // Limiar para detectar mudança de peso
+const int32_t change_threshold = 300; // Limiar para detectar mudança de peso
 
 float smoothed_value_ema = 0.0f;
 int first_reading = 1;
 
 // --- VARIÁVEIS PARA O RASTREAMENTO AUTOMÁTICO DE ZERO ---
 const float auto_zero_threshold_grams = 0.2f;
-const uint32_t auto_zero_time_ms = 3000; // 3 segundos
+const uint32_t auto_zero_time_ms = 1000; // 3 segundos
 uint32_t near_zero_start_time = 0;
 uint8_t is_near_zero = 0;
 
@@ -57,6 +67,7 @@ uint8_t is_near_zero = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void DWIN_SendData(uint16_t vp_address, int32_t value);
+void WaitForThermalStability(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -115,6 +126,7 @@ int main(void)
 
   ADS1232_Read();
 
+	
   // Força o filtro a inicializar com o primeiro valor de tara
   smoothed_value_ema = (float)ADS1232_Tare(); 
   first_reading = 0;
@@ -136,7 +148,7 @@ int main(void)
       // --- LÓGICA DE LEITURA DO BOTÃO (POLLING & DEBOUNCE) - CORRIGIDA ---
       GPIO_PinState current_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
 
-      // Esta linha é crucial para o debounce funcionar
+      // Atualiza o timer de debounce sempre que o estado do botão muda
       if (current_state != last_button_state) {
           last_debounce_time = HAL_GetTick();
       }
@@ -148,6 +160,10 @@ int main(void)
                   int32_t new_offset = ADS1232_Tare(); 
                   smoothed_value_ema = (float)new_offset;
                   first_reading = 0;
+                  
+                  // Reinicia a máquina de estados e o peso travado
+                  scale_state = STATE_TRANSITION; 
+                  locked_weight_grams = 0.0f;
               }
           }
       }
@@ -155,26 +171,71 @@ int main(void)
       // --- FIM DA LÓGICA DO BOTÃO ---
 
 
-      // --- LÓGICA DE LEITURA, FILTRO E ENVIO DIRETO ---
+      // --- LÓGICA PRINCIPAL: Roda a cada nova leitura do ADC ---
       if (HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_RESET)
       {
+          // 1. LÊ o valor bruto
           raw_value = ADS1232_Read();
 
+          // 2. APLICA o filtro adaptativo e atualiza o estado
           if (first_reading) {
               smoothed_value_ema = (float)raw_value;
               first_reading = 0;
           } else {
               int32_t diff = abs((int32_t)raw_value - (int32_t)smoothed_value_ema);
+              
+              // Se uma grande mudança for detectada, sempre volta para o estado de TRANSIÇÃO
               if (diff > change_threshold) {
+                  scale_state = STATE_TRANSITION;
+              }
+
+              // Aplica o filtro com base no estado
+              if (scale_state == STATE_TRANSITION) {
                   smoothed_value_ema = (alpha_fast * (float)raw_value) + ((1.0f - alpha_fast) * smoothed_value_ema);
-              } else {
+              } else { // Para STATE_STABILIZING ou STATE_LOCKED
                   smoothed_value_ema = (alpha_slow * (float)raw_value) + ((1.0f - alpha_slow) * smoothed_value_ema);
               }
           }
           
-          weight_in_grams = ADS1232_ConvertToGrams((int32_t)smoothed_value_ema);
+          // 3. PROCESSA a máquina de estados para decidir o que mostrar
+          switch(scale_state)
+          {
+              case STATE_TRANSITION:
+                  weight_in_grams = ADS1232_ConvertToGrams((int32_t)smoothed_value_ema);
+                  // Se as leituras começarem a se acalmar, muda para o estado de ESTABILIZAÇÃO
+                  if (abs((int32_t)raw_value - (int32_t)smoothed_value_ema) <= change_threshold) {
+                      scale_state = STATE_STABILIZING;
+                      stabilizing_start_time = HAL_GetTick();
+                  }
+                  break;
+
+              case STATE_STABILIZING:
+                  weight_in_grams = ADS1232_ConvertToGrams((int32_t)smoothed_value_ema);
+    
+									// Verifica se o tempo de estabilização passou
+									if (HAL_GetTick() - stabilizing_start_time > time_to_lock_ms) 
+									{
+											// CONDIÇÃO ADICIONAL: Só trava a leitura se o peso for significativo,
+											// ou seja, MAIOR ou IGUAL ao limiar do auto-zero.
+											if (fabsf(weight_in_grams) >= auto_zero_threshold_grams) 
+											{
+													locked_weight_grams = weight_in_grams; // Trava o valor!
+													scale_state = STATE_LOCKED;
+											}
+											// Se o peso for pequeno (dentro da faixa de auto-zero), ele NÃO TRAVA.
+											// O estado permanece em STABILIZING, permitindo que a lógica de auto-zero 
+											// continue a ajustar a leitura suavemente até que ela atinja a deadband de 0.000.
+									}
+									break;
+
+              case STATE_LOCKED:
+                  // Uma vez travado, o peso a ser exibido será sempre o valor que foi travado
+                  weight_in_grams = locked_weight_grams;
+                  break;
+          }
           
-          if (fabsf(weight_in_grams) < 0.015f || weight_in_grams < 0.0f) {
+          // 4. APLICA a deadband e o auto-zero
+          if (fabsf(weight_in_grams) < 0.018f || weight_in_grams < 0) { 
               weight_in_grams = 0.0f;
           }
           
@@ -183,20 +244,21 @@ int main(void)
                   is_near_zero = 1;
                   near_zero_start_time = HAL_GetTick();
               } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
-                  int32_t new_offset = (int32_t)smoothed_value_ema;
-                  ADS1232_SetOffset(new_offset);
-                  near_zero_start_time = HAL_GetTick();
+                  float current_offset = (float)ADS1232_GetOffset();
+                  float new_offset_smooth = (0.001f * smoothed_value_ema) + (0.999f * current_offset);
+                  ADS1232_SetOffset((int32_t)new_offset_smooth);
               }
           } else {
               is_near_zero = 0;
           }
 					
-					printf("Peso: %.3f\n\r", weight_in_grams);
 					
+					printf("Peso: %.3f\n\r", weight_in_grams);
+          // 5. ENVIA para o display DWIN
           int32_t weight_for_dwin = (int32_t)(weight_in_grams * 1000.0f);
-          
           DWIN_SendData(0x2000, weight_for_dwin); // VP 0x2000 conforme seu código
 
+          // 6. PISCA o LED para indicar atividade
           HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
       }
     /* USER CODE END WHILE */
@@ -204,6 +266,41 @@ int main(void)
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
+}
+
+void WaitForThermalStability(void)
+{
+    printf("Aguardando estabilidade termica do ADC...\r\n");
+
+    const int num_readings = 50; // Quantidade de leituras por ciclo de verificação
+    const int stability_target = 100; // Variação máxima permitida entre as médias (ajustável)
+    int32_t last_avg = 0;
+    int stable_cycles = 0;
+
+    // Loop principal: continua até que a leitura se estabilize por 3 ciclos seguidos
+    while (stable_cycles < 3)
+    {
+        int64_t current_sum = 0;
+        // Faz uma série de leituras e calcula a média
+        for (int i = 0; i < num_readings; i++) {
+            // Aguarda um novo dado do ADC
+            while(HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_SET);
+            current_sum += ADS1232_Read();
+        }
+        int32_t current_avg = current_sum / num_readings;
+
+        // Compara a média atual com a média do ciclo anterior
+        if (abs(current_avg - last_avg) < stability_target && last_avg != 0) {
+            stable_cycles++; // Se a diferença for pequena, conta como um ciclo estável
+        } else {
+            stable_cycles = 0; // Se a diferença for grande, o drift ainda está ocorrendo
+        }
+
+        last_avg = current_avg; // Atualiza a última média
+        printf("Drift check... Media atual: %ld\r\n", (long)current_avg);
+        HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
+    }
+    printf("Sistema termicamente estavel.\r\n");
 }
 
 /**
