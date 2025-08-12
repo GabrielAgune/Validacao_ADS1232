@@ -22,11 +22,20 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+// --- MÁQUINA DE ESTADOS PARA CONTROLE DA LEITURA ---
+typedef enum {
+    STATE_TRANSITION,  // O peso está a mudar
+    STATE_STABILIZING, // O peso parou de mudar, a aguardar para travar
+    STATE_LOCKED       // O peso está estável e o valor no display está travado
+} ScaleState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// --- PARÂMETROS DO FILTRO (AJUSTE FINO DE PRECISÃO) ---
+#define REGRESSION_BUFFER_SIZE 40      // Aumenta a janela de média para suavizar ainda mais
+const float slope_threshold = 8.0f;    // Um pouco mais rigoroso para garantir a estabilidade
+const uint32_t time_to_lock_ms = 1200; // Aumenta o tempo de espera para 1.2 segundos
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -36,39 +45,36 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-// --- VARIÁVEIS PARA O FILTRO EMA ADAPTATIVO (Valores Otimizados) ---
-const float alpha_slow = 0.25f; // Equilíbrio entre estabilidade e velocidade de convergência
-const float alpha_fast = 0.5f;  // Resposta inicial rápida
-const int32_t change_threshold = 500;
+// --- Buffer e variáveis para a regressão linear ---
+int32_t regression_buffer[REGRESSION_BUFFER_SIZE] = {0};
+int regression_index = 0;
+uint8_t buffer_filled = 0;
 
-float smoothed_value_ema = 0.0f;
-int first_reading = 1;
+// Variáveis pré-calculadas para otimizar a performance
+long long sum_x = 0;
+long long sum_x_sq = 0;
+float regression_denominator = 0.0f;
 
-// --- VARIÁVEIS PARA O RASTREAMENTO AUTOMÁTICO DE ZERO ---
-const float auto_zero_threshold_grams = 0.2f;
-const uint32_t auto_zero_time_ms = 1500;
+// Variáveis da máquina de estados
+ScaleState_t scale_state = STATE_TRANSITION;
+float locked_weight_grams = 0.0f;
+uint32_t stabilizing_start_time = 0;
+
+// --- Variáveis para o Rastreamento Automático de Zero INTELIGENTE ---
+int32_t absolute_zero_offset = 0;      // Guarda o valor bruto do ADC para o zero real
+const int32_t AUTO_ZERO_THRESHOLD_COUNTS = 1500; // Limiar em contagens do ADC (aprox. 0.25g)
+const uint32_t auto_zero_time_ms = 3000;
 uint32_t near_zero_start_time = 0;
 uint8_t is_near_zero = 0;
 
 /* USER CODE BEGIN PV */
-typedef enum {
-    STATE_TRANSITION,  // O peso está mudando rapidamente
-    STATE_STABILIZING, // A mudança parou, aguardando confirmação
-    STATE_LOCKED       // A leitura está estável e o valor travado
-} ScaleState_t;
 
-ScaleState_t scale_state = STATE_TRANSITION; // Estado inicial
-float locked_weight_grams = 0.0f;            // Variável para armazenar o peso travado
-uint32_t stabilizing_start_time = 0;         // Timer para o tempo de estabilização
-// Tempo em ms que o peso precisa ficar estável para travar (ex: 1.5 segundos)
-const uint32_t time_to_lock_ms = 1500;    
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void DWIN_SendData(uint16_t vp_address, int32_t value);
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -98,8 +104,6 @@ void DWIN_SendData(uint16_t vp_address, int32_t value)
     HAL_UART_Transmit(&huart1, dwin_frame, 10, 100);
 }
 
-
-
 /* USER CODE END 0 */
 
 /**
@@ -120,13 +124,25 @@ int main(void)
   GPIO_PinState last_button_state = GPIO_PIN_SET;
   uint32_t last_debounce_time = 0;
 	
+  // --- PRÉ-CÁLCULO DOS TERMOS DA REGRESSÃO LINEAR ---
+  for(int i = 0; i < REGRESSION_BUFFER_SIZE; i++) {
+      sum_x += i;
+      sum_x_sq += (long long)i * i;
+  }
+  if (REGRESSION_BUFFER_SIZE > 0) {
+      regression_denominator = (float)((long long)REGRESSION_BUFFER_SIZE * sum_x_sq - (sum_x * sum_x));
+  }
+	
   printf("\r\n--- Balanca de Precisao com ADS1232 e Display DWIN ---\r\n");
 
   ADS1232_Init();
   
-
-  smoothed_value_ema = (float)ADS1232_Tare(); 
-  first_reading = 0;
+  // A tara inicial é executada para definir o ZERO ABSOLUTO.
+  // Esta é a nossa referência para o Auto-Zero.
+  absolute_zero_offset = ADS1232_Tare(); // Guardamos o offset do "chão"
+  for(int i = 0; i < REGRESSION_BUFFER_SIZE; i++) {
+      regression_buffer[i] = absolute_zero_offset;
+  }
 	
   printf("\r\nSistema pronto. Balanca vazia e tarada.\r\n");
   
@@ -142,124 +158,116 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      // --- LÓGICA DE LEITURA DO BOTÃO (POLLING & DEBOUNCE) - CORRIGIDA ---
-      GPIO_PinState current_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
+    /* USER CODE END WHILE */
 
-      // Atualiza o timer de debounce sempre que o estado do botão muda
+    /* USER CODE BEGIN 3 */
+	  
+	  // --- LÓGICA DE LEITURA DO BOTÃO (POLLING & DEBOUNCE) ---
+      GPIO_PinState current_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
       if (current_state != last_button_state) {
           last_debounce_time = HAL_GetTick();
       }
-
-      if ((HAL_GetTick() - last_debounce_time) > 50) { 
+      if ((HAL_GetTick() - last_debounce_time) > 50) {
           if (current_state != button_state) {
               button_state = current_state;
-              if (button_state == GPIO_PIN_RESET) { // Botão foi pressionado
-                  int32_t new_offset = ADS1232_Tare(); 
-                  smoothed_value_ema = (float)new_offset;
-                  first_reading = 0;
-                  
-                  // Reinicia a máquina de estados e o peso travado
-                  scale_state = STATE_TRANSITION; 
-                  locked_weight_grams = 0.0f;
+              if (button_state == GPIO_PIN_RESET) {
+                  int32_t new_offset = ADS1232_Tare(); // Executa a tara manual
+                  // Preenche o buffer com o novo offset para estabilizar a regressão
+                  for(int i = 0; i < REGRESSION_BUFFER_SIZE; i++) regression_buffer[i] = new_offset;
+                  buffer_filled = 0;
+                  regression_index = 0;
+                  scale_state = STATE_TRANSITION; // Força a reavaliação do estado
               }
           }
       }
       last_button_state = current_state;
-      // --- FIM DA LÓGICA DO BOTÃO ---
 
-
-      // --- LÓGICA PRINCIPAL: Roda a cada nova leitura do ADC ---
+      // --- LÓGICA PRINCIPAL ---
       if (HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_RESET)
       {
-          // 1. LÊ o valor bruto
           raw_value = ADS1232_Read();
 
-          // 2. APLICA o filtro adaptativo e atualiza o estado
-          if (first_reading) {
-              smoothed_value_ema = (float)raw_value;
-              first_reading = 0;
-          } else {
-              int32_t diff = abs((int32_t)raw_value - (int32_t)smoothed_value_ema);
-              
-              // Se uma grande mudança for detectada, sempre volta para o estado de TRANSIÇÃO
-              if (diff > change_threshold) {
-                  scale_state = STATE_TRANSITION;
-              }
+          regression_buffer[regression_index] = raw_value;
+          regression_index = (regression_index + 1) % REGRESSION_BUFFER_SIZE;
+          if (!buffer_filled && regression_index == 0) {
+              buffer_filled = 1;
+          }
 
-              // Aplica o filtro com base no estado
-              if (scale_state == STATE_TRANSITION) {
-                  smoothed_value_ema = (alpha_fast * (float)raw_value) + ((1.0f - alpha_fast) * smoothed_value_ema);
-              } else { // Para STATE_STABILIZING ou STATE_LOCKED
-                  smoothed_value_ema = (alpha_slow * (float)raw_value) + ((1.0f - alpha_slow) * smoothed_value_ema);
+          float slope = 0.0f;
+          long long sum_y = 0;
+          int32_t average_raw_value = raw_value;
+
+          if (buffer_filled) {
+              long long sum_xy = 0;
+              for (int i = 0; i < REGRESSION_BUFFER_SIZE; i++) {
+                  sum_y += regression_buffer[i];
+                  sum_xy += (long long)i * regression_buffer[(regression_index + i) % REGRESSION_BUFFER_SIZE];
+              }
+              
+              average_raw_value = sum_y / REGRESSION_BUFFER_SIZE;
+
+              if (regression_denominator != 0.0f) {
+                  slope = ((float)((long long)REGRESSION_BUFFER_SIZE * sum_xy - sum_x * sum_y)) / regression_denominator;
               }
           }
-          
-          // 3. PROCESSA a máquina de estados para decidir o que mostrar
+
+          // --- ATUALIZAÇÃO DA MÁQUINA DE ESTADOS ---
+          if (fabsf(slope) > slope_threshold && buffer_filled) {
+              scale_state = STATE_TRANSITION;
+          }
+
           switch(scale_state)
           {
               case STATE_TRANSITION:
-                  weight_in_grams = ADS1232_ConvertToGrams((int32_t)smoothed_value_ema);
-                  // Se as leituras começarem a se acalmar, muda para o estado de ESTABILIZAÇÃO
-                  if (abs((int32_t)raw_value - (int32_t)smoothed_value_ema) <= change_threshold) {
+                  weight_in_grams = ADS1232_ConvertToGrams(raw_value);
+                  if (fabsf(slope) <= slope_threshold && buffer_filled) {
                       scale_state = STATE_STABILIZING;
                       stabilizing_start_time = HAL_GetTick();
                   }
                   break;
 
               case STATE_STABILIZING:
-									weight_in_grams = ADS1232_ConvertToGrams((int32_t)smoothed_value_ema);
-									
-									// Verifica se o tempo de estabilização passou
-									if (HAL_GetTick() - stabilizing_start_time > time_to_lock_ms) 
-									{
-											// CONDIÇÃO ADICIONAL: Só trava a leitura se o peso for significativo,
-											// ou seja, MAIOR ou IGUAL ao limiar do auto-zero.
-											if (fabsf(weight_in_grams) >= auto_zero_threshold_grams) 
-											{
-													locked_weight_grams = weight_in_grams; // Trava o valor!
-													scale_state = STATE_LOCKED;
-											}
-											// Se o peso for pequeno (dentro da faixa de auto-zero), ele NÃO TRAVA.
-											// O estado permanece em STABILIZING, permitindo que a lógica de auto-zero 
-											// continue a ajustar a leitura suavemente até que ela atinja a deadband de 0.000.
-									}
-									break;
+                  weight_in_grams = ADS1232_ConvertToGrams(average_raw_value);
+                  if (HAL_GetTick() - stabilizing_start_time > time_to_lock_ms) {
+                      locked_weight_grams = weight_in_grams;
+                      scale_state = STATE_LOCKED;
+                  }
+                  break;
 
               case STATE_LOCKED:
-                  // Uma vez travado, o peso a ser exibido será sempre o valor que foi travado
                   weight_in_grams = locked_weight_grams;
                   break;
           }
           
-          // 4. APLICA a deadband e o auto-zero
-          if (fabsf(weight_in_grams) < 0.015f || weight_in_grams < 0.0f) { // Sua deadband de 0.005g
+          // --- LÓGICA DE AUTO-ZERO INTELIGENTE ---
+          // A condição do Auto-Zero agora verifica se a leitura BRUTA está perto do ZERO ABSOLUTO
+          if (abs(average_raw_value - absolute_zero_offset) < AUTO_ZERO_THRESHOLD_COUNTS) {
+              // Se estivermos perto do zero absoluto, o peso a ser mostrado é zero.
               weight_in_grams = 0.0f;
-          }
-          
-          if (fabsf(weight_in_grams) < auto_zero_threshold_grams) {
+
               if (is_near_zero == 0) {
                   is_near_zero = 1;
                   near_zero_start_time = HAL_GetTick();
               } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
-                  float current_offset = (float)ADS1232_GetOffset();
-                  float new_offset_smooth = (0.001f * smoothed_value_ema) + (0.999f * current_offset);
-                  ADS1232_SetOffset((int32_t)new_offset_smooth);
+                  // O Auto-Zero só é ativado se a balança estiver FISICAMENTE vazia
+                  ADS1232_SetOffset(average_raw_value); 
+                  // Atualiza também o nosso zero absoluto para compensar o drift
+                  absolute_zero_offset = average_raw_value; 
+                  weight_in_grams = 0.0f;
+                  scale_state = STATE_TRANSITION; 
+                  near_zero_start_time = HAL_GetTick(); // Reinicia o timer
               }
           } else {
               is_near_zero = 0;
           }
-					
-					printf("Peso: %.3f\n\r", weight_in_grams);
-          // 5. ENVIA para o display DWIN
+          
+          printf("Peso: %.3f\r\n", weight_in_grams);
+          
           int32_t weight_for_dwin = (int32_t)(weight_in_grams * 1000.0f);
-          DWIN_SendData(0x2000, weight_for_dwin); // VP 0x2000 conforme seu código
-
-          // 6. PISCA o LED para indicar atividade
+          DWIN_SendData(0x2000, weight_for_dwin);
+          
           HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
       }
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
