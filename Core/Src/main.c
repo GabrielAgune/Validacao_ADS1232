@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body (v11 - Lógica de Auto-Zero Corrigida)
+  * @brief          : Main program body (v11.1 - Correção do Loop de Auto-Zero)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -160,7 +160,7 @@ int main(void)
                       readings_buffer[i] = absolute_zero_offset;
                   }
                   buffer_index = 0;
-                  buffer_filled = 1; // O buffer está "cheio" com o novo valor de tara
+                  buffer_filled = 1;
                   scale_state = STATE_TRANSITION;
               }
           }
@@ -219,16 +219,16 @@ int main(void)
               break;
       }
       
-      // --- LÓGICA DE AUTO-ZERO SIMPLIFICADA ---
+      // --- LÓGICA DE AUTO-ZERO CORRIGIDA ---
       if (buffer_filled && abs((int32_t)average_y - absolute_zero_offset) < AUTO_ZERO_THRESHOLD_COUNTS) {
           if (is_near_zero == 0) {
               is_near_zero = 1;
               near_zero_start_time = HAL_GetTick();
           } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
-              // A condição 'is_stable' foi removida para evitar o ciclo vicioso
               absolute_zero_offset = ADS1232_Tare();
               weight_in_grams = 0.0f;
               scale_state = STATE_TRANSITION;
+              near_zero_start_time = HAL_GetTick(); // <<<<<< CORREÇÃO CRÍTICA: REINICIA O TEMPORIZADOR
           }
       } else {
           is_near_zero = 0;
