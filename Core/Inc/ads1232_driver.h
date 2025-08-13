@@ -1,50 +1,31 @@
-#ifndef INC_ADS1232_DRIVER_H_
-#define INC_ADS1232_DRIVER_H_
+#ifndef __ADS1232_DRIVER_H
+#define __ADS1232_DRIVER_H
 
-#include "main.h" // Inclui para ter acesso aos tipos HAL
+#include "main.h"
+#include <stdint.h>
 
-// --- Funções Públicas do Driver ---
+// --- DEFINIÇÕES PARTILHADAS PARA CALIBRAÇÃO ---
+#define NUM_CAL_POINTS 4
 
-/**
-  * @brief Inicializa o ADC ADS1232.
-  */
+typedef struct {
+    float grams;
+    int32_t adc_value;
+} CalPoint_t;
+
+// Declaração 'extern' para tornar a tabela visível para outros ficheiros
+extern CalPoint_t cal_points[NUM_CAL_POINTS];
+
+
+// --- Funções Públicas ---
 void ADS1232_Init(void);
-
-/**
-  * @brief Executa o procedimento de tara, zerando a medição atual.
-  */
-int32_t ADS1232_Tare(void);
-
-/**
-  * @brief Lê o valor raw de 24 bits do ADC (leitura única e direta).
-  * @retval O valor de 32 bits com sinal lido do ADC.
-  */
 int32_t ADS1232_Read(void);
-
-/**
-  * @brief Define o fator de calibração para a conversão para gramas.
-  * @param factor O fator calculado (valor_raw / peso_conhecido_g).
-  */
+int32_t ADS1232_Read_Median_of_3(void);
+int32_t ADS1232_Tare(void);
 void ADS1232_SetCalibrationFactor(float factor);
-
-/**
- * @brief Lê múltiplas amostras do ADS1232 (no modo 80SPS) e retorna a sua média.
- * @retval A média filtrada das leituras do ADC.
- */
-int32_t ADS1232_Read_Filtered(void); 
-
-/**
-  * @brief Converte o valor raw atual em gramas.
-  * @retval O peso calculado em gramas.
-  */
 float ADS1232_ConvertToGrams(int32_t raw_value);
-
-/**
-  * @brief Obtém o valor de offset atual (tara).
-  * @retval O valor do offset.
-  */
 int32_t ADS1232_GetOffset(void);
-
 void ADS1232_SetOffset(int32_t new_offset);
+float ADS1232_GetCalibrationFactor(void);
 
-#endif /* INC_ADS1232_DRIVER_H_ */
+
+#endif // __ADS1232_DRIVER_H

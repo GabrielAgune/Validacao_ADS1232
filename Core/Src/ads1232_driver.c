@@ -2,146 +2,126 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// --- Variáveis Estáticas (Privadas ao Módulo) ---
+// --- DEFINIÇÃO DA TABELA DE CALIBRAÇÃO ---
+// Os valores de adc_value devem ser preenchidos por você com a rotina de calibração
+CalPoint_t cal_points[NUM_CAL_POINTS] = {
+    {0.0f, 235469},
+    {50.0f, 546061},
+    {100.0f, 856428},
+    {200.0f, 1477409}
+};
+
+// --- Variáveis Estáticas ---
 static int32_t adc_offset = 0;
-static float calibration_factor = 1.0f;
 
 // --- Funções Privadas ---
 static void delay_us(uint32_t us) {
     for(volatile uint32_t i = 0; i < us * 8; i++);
 }
 
-// --- Implementação das Funções Públicas ---
-
-void ADS1232_Init(void) {
-    // Garante que PDWN esteja baixo enquanto a alimentação estabiliza
-    HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_RESET);
-    HAL_Delay(1); // Espera 1ms para garantir
-
-    // Sequência de toggle recomendada pelo datasheet (t16 e t17)
-    // t16: Pulso ALTO em PDWN (mínimo 26µs) [cite: 1311]
-    HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_SET);
-    delay_us(50);
-
-    // t17: Pulso BAIXO em PDWN (mínimo 26µs) [cite: 1311]
-    HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_RESET);
-    delay_us(50);
-
-    // Deixa PDWN em ALTO para o modo de operação normal
-    HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_SET);
-    //printf("Driver ADS1232 Inicializado.\r\n");
+static void sort_three(int32_t *a, int32_t *b, int32_t *c) {
+    int32_t temp;
+    if (*a > *b) { temp = *a; *a = *b; *b = temp; }
+    if (*b > *c) { temp = *b; *b = *c; *c = temp; }
+    if (*a > *b) { temp = *a; *a = *b; *b = temp; }
 }
 
-// Em ads1232_driver.c
+// --- Implementação das Funções Públicas ---
+void ADS1232_Init(void) {
+    HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_RESET);
+    HAL_Delay(1); 
+    HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_SET);
+}
 
 int32_t ADS1232_Read(void) {
     uint32_t data = 0;
     uint32_t timeout = HAL_GetTick() + 200;
 
-    // Espera até que DRDY/DOUT fique em nível baixo
     while(HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_SET) {
-        if (HAL_GetTick() > timeout) {
-            //printf("TIMEOUT! DRDY nao ficou baixo.\r\n");
-            return 0; // Retorna 0 em caso de timeout
-        }
+        if (HAL_GetTick() > timeout) return 0;
     }
 
-    // Pequeno delay para garantir que o sinal esteja estável
-    delay_us(1);
-
-    // Desativa interrupções brevemente para garantir a integridade da leitura bit-a-bit
     __disable_irq();
-
-    // Lê os 24 bits de dados
     for(int i = 0; i < 24; i++) {
         HAL_GPIO_WritePin(ADC_SCLK_GPIO_Port, ADC_SCLK_Pin, GPIO_PIN_SET);
-        delay_us(2);
+        delay_us(1);
         data = data << 1;
-        if(HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_SET) {
-            data |= 1;
-        }
+        if(HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_SET) data |= 1;
         HAL_GPIO_WritePin(ADC_SCLK_GPIO_Port, ADC_SCLK_Pin, GPIO_PIN_RESET);
-        delay_us(2);
+        delay_us(1);
     }
-
-    // --- CORREÇÃO CRÍTICA ABAIXO ---
-    // Envia um 25º pulso de clock para forçar DRDY/DOUT para nível ALTO.
-    // Isso evita que o loop principal tente ler os mesmos dados duas vezes.
     HAL_GPIO_WritePin(ADC_SCLK_GPIO_Port, ADC_SCLK_Pin, GPIO_PIN_SET);
-    delay_us(2);
+    delay_us(1);
     HAL_GPIO_WritePin(ADC_SCLK_GPIO_Port, ADC_SCLK_Pin, GPIO_PIN_RESET);
-    delay_us(2);
-
-    // Reativa as interrupções
     __enable_irq();
 
-    // Faz a extensão de sinal para 32 bits (número negativo)
-    if (data & 0x800000) {
-        data |= 0xFF000000;
-    }
-
+    if (data & 0x800000) data |= 0xFF000000;
     return (int32_t)data;
+}
+
+int32_t ADS1232_Read_Median_of_3(void) {
+    int32_t s1 = ADS1232_Read();
+    int32_t s2 = ADS1232_Read();
+    int32_t s3 = ADS1232_Read();
+    sort_three(&s1, &s2, &s3);
+    return s2;
 }
 
 int32_t ADS1232_Tare(void) { 
     printf("Tarando... Aguarde estabilidade.\r\n");
-
-    const int num_samples_for_stability = 20; // Número de amostras para checar estabilidade
-    const int32_t stability_threshold = 500;   // Tolerância máxima entre leituras (ajuste conforme necessário)
-    int32_t samples[num_samples_for_stability];
-    int stable_count = 0;
-    int max_retries = 10; // Tenta estabilizar por no máximo 10 ciclos
+    const int num_samples = 20;
+    const int32_t stability_threshold = 500;
+    int max_retries = 10;
     
     for (int retry = 0; retry < max_retries; retry++) {
-        int32_t min_val = 0x7FFFFFFF;
-        int32_t max_val = 0x80000000;
         int64_t sum = 0;
-
-        for (int i = 0; i < num_samples_for_stability; i++) {
-            samples[i] = ADS1232_Read();
-            sum += samples[i];
-            if (samples[i] < min_val) min_val = samples[i];
-            if (samples[i] > max_val) max_val = samples[i];
-            HAL_Delay(10); // Pequeno delay entre as leituras
+        int32_t min_val = 0x7FFFFFFF, max_val = 0x80000000;
+        for (int i = 0; i < num_samples; i++) {
+            int32_t sample = ADS1232_Read_Median_of_3();
+            sum += sample;
+            if (sample < min_val) min_val = sample;
+            if (sample > max_val) max_val = sample;
+            HAL_Delay(10);
         }
-
-        // Verifica se a diferença entre a maior e a menor leitura está dentro da tolerância
         if ((max_val - min_val) < stability_threshold) {
-            stable_count++;
-        } else {
-            stable_count = 0; // Reseta se não estiver estável
-        }
-
-        // Se as leituras permanecerem estáveis por 2 ciclos consecutivos, consideramos a tara bem-sucedida
-        if (stable_count >= 2) {
-            adc_offset = sum / num_samples_for_stability;
-            printf("Tara estavel concluida! Offset = %ld\r\n", (long)adc_offset);
+            adc_offset = sum / num_samples;
+            // Atualiza o ponto zero na tabela de calibração
+            cal_points[0].adc_value = adc_offset; 
+            printf("Tara estavel concluida! Offset = %d\r\n", (int)adc_offset);
             return adc_offset; 
         }
-        
-        printf("Leituras instaveis (diff: %ld). Tentando novamente...\r\n", (long)(max_val - min_val));
+        printf("Leituras instaveis (diff: %d). Tentando novamente...\r\n", (int)(max_val - min_val));
     }
-
-    // Se saiu do loop, a balança não estabilizou. Usa a média da última tentativa.
-    printf("AVISO: Balanca nao estabilizou. Usando ultima media como tara.\r\n");
-    int64_t last_sum = 0;
-    for(int i = 0; i < num_samples_for_stability; i++) {
-        last_sum += samples[i];
-    }
-    adc_offset = last_sum / num_samples_for_stability;
-    printf("Tara concluida! Offset = %ld\r\n", (long)adc_offset);
-		return adc_offset;
-}
-
-void ADS1232_SetCalibrationFactor(float factor) {
-    calibration_factor = factor;
+    printf("AVISO: Balanca nao estabilizou.\r\n");
+    return adc_offset; // Retorna o offset antigo se falhar
 }
 
 float ADS1232_ConvertToGrams(int32_t raw_value) {
-    if (calibration_factor == 0.0f) {
-        return 0.0f;
+    // A extrapolação para valores abaixo de 0g é feita com o primeiro segmento (0-50g)
+    if (raw_value < cal_points[0].adc_value) {
+        float factor = (cal_points[1].grams - cal_points[0].grams) / 
+                       (float)(cal_points[1].adc_value - cal_points[0].adc_value);
+        return (float)(raw_value - cal_points[0].adc_value) * factor;
     }
-    return (float)(raw_value - adc_offset) / calibration_factor;
+
+    // Procura o segmento correto para interpolação
+    for (int i = 0; i < NUM_CAL_POINTS - 1; i++) {
+        if (raw_value <= cal_points[i+1].adc_value) {
+            float adc_range = (float)(cal_points[i+1].adc_value - cal_points[i].adc_value);
+            if (adc_range == 0) return cal_points[i].grams;
+
+            float gram_range = cal_points[i+1].grams - cal_points[i].grams;
+            float ratio = (float)(raw_value - cal_points[i].adc_value) / adc_range;
+            return cal_points[i].grams + (ratio * gram_range);
+        }
+    }
+
+    // A extrapolação para valores acima do último ponto é feita com o último segmento
+    int last = NUM_CAL_POINTS - 1;
+    int second_last = NUM_CAL_POINTS - 2;
+    float factor = (cal_points[last].grams - cal_points[second_last].grams) / 
+                   (float)(cal_points[last].adc_value - cal_points[second_last].adc_value);
+    return cal_points[last].grams + ((float)(raw_value - cal_points[last].adc_value) * factor);
 }
 
 int32_t ADS1232_GetOffset(void) {
@@ -150,23 +130,5 @@ int32_t ADS1232_GetOffset(void) {
 
 void ADS1232_SetOffset(int32_t new_offset) {
     adc_offset = new_offset;
-}
-
-/**
- * @brief Lê múltiplas amostras do ADS1232 (no modo 80SPS) e retorna a sua média.
- * @note Esta função chama a função ADS1232_Read() internamente.
- * @retval A média filtrada das leituras do ADC.
- */
-int32_t ADS1232_Read_Filtered(void)
-{
-    // Vamos tirar a média de 8 amostras. 
-    // Como estamos a 80SPS, isto nos dará uma leitura estável a cada 100ms (10 leituras por segundo).
-    const int num_samples_to_average = 8;
-    int64_t sum_of_samples = 0; // Usamos 64 bits para evitar overflow na soma
-
-    for (int i = 0; i < num_samples_to_average; i++) {
-        sum_of_samples += ADS1232_Read(); // Chama a sua função de leitura original
-    }
-
-    return (int32_t)(sum_of_samples / num_samples_to_average);
+    cal_points[0].adc_value = new_offset; // Garante que o ponto zero está sempre atualizado
 }

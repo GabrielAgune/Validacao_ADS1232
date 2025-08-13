@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body (v5 - Filtro Reajustado, Guarda Removida)
+  * @brief          : Main program body (v11 - Lógica de Auto-Zero Corrigida)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -31,8 +31,13 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-const float stability_slope_threshold = 20.0f; // Limiar de velocidade para estabilização
-const uint32_t time_to_lock_ms = 1000;      // Tempo de espera para travar
+#define FILT_WIN_SIZE 32
+
+const float STABILITY_SLOPE_THRESHOLD = 8.0f;     
+const float STABILITY_SIGMA_THRESHOLD = 40.0f; 
+const uint32_t TIME_TO_LOCK_MS = 1000;         
+
+const float HYSTERESIS_GRAMS = 0.05f; 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -42,18 +47,18 @@ const uint32_t time_to_lock_ms = 1000;      // Tempo de espera para travar
 
 /* Private variables ---------------------------------------------------------*/
 
-// --- Variáveis do Filtro Preditivo Alpha-Beta (Valores Equilibrados) ---
-float kalman_x = 0.0f;
-float kalman_v = 0.0f;
-const float alpha = 0.95f;  // Rápido, mas estável
-const float beta  = 0.08f; // Suaviza a velocidade, mas permite reação
+int32_t readings_buffer[FILT_WIN_SIZE] = {0};
+int buffer_index = 0;
+uint8_t buffer_filled = 0;
 
-// --- Variáveis da máquina de estados ---
+long long sum_x = 0;
+long long sum_x_sq = 0;
+float regression_denominator = 0.0f;
+
 ScaleState_t scale_state = STATE_TRANSITION;
 float locked_weight_grams = 0.0f;
 uint32_t stabilizing_start_time = 0;
 
-// --- Variáveis para o Auto-Zero Inteligente ---
 int32_t absolute_zero_offset = 0;
 const int32_t AUTO_ZERO_THRESHOLD_COUNTS = 1500;
 const uint32_t auto_zero_time_ms = 3000;
@@ -61,13 +66,15 @@ uint32_t near_zero_start_time = 0;
 uint8_t is_near_zero = 0;
 
 /* USER CODE BEGIN PV */
-
+float sigma_g = 0.0f;
+float slope_g = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void DWIN_SendData(uint16_t vp_address, int32_t value);
+void Calculate_Statistics(float* p_avg_y, float* p_sigma, float* p_slope);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -117,16 +124,21 @@ int main(void)
   ADS1232_Init();
   
   absolute_zero_offset = ADS1232_Tare();
-  kalman_x = (float)absolute_zero_offset;
-  kalman_v = 0.0f;
+  
+  for(int i = 0; i < FILT_WIN_SIZE; i++) {
+      readings_buffer[i] = absolute_zero_offset;
+  }
+	
+  for(int i = 0; i < FILT_WIN_SIZE; i++) {
+      sum_x += i;
+      sum_x_sq += (long long)i * i;
+  }
+  regression_denominator = (float)((long long)FILT_WIN_SIZE * sum_x_sq - (sum_x * sum_x));
 	
   printf("\r\nSistema pronto. Balanca vazia e tarada.\r\n");
   
-  ADS1232_SetCalibrationFactor(6208.87f); 
-	
   printf("Driver DWIN Inicializado na USART1.\r\n");
 	
-  int32_t raw_value;
   float weight_in_grams;
   /* USER CODE END 2 */
 
@@ -134,11 +146,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-	  
-	  // --- LÓGICA DE LEITURA DO BOTÃO ---
+      // --- LÓGICA DE LEITURA DO BOTÃO ---
       GPIO_PinState current_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
       if (current_state != last_button_state) {
           last_debounce_time = HAL_GetTick();
@@ -147,83 +155,101 @@ int main(void)
           if (current_state != button_state) {
               button_state = current_state;
               if (button_state == GPIO_PIN_RESET) {
-                  int32_t new_offset = ADS1232_Tare();
-                  kalman_x = (float)new_offset;
-                  kalman_v = 0.0f;
+                  absolute_zero_offset = ADS1232_Tare();
+                  for(int i = 0; i < FILT_WIN_SIZE; i++) {
+                      readings_buffer[i] = absolute_zero_offset;
+                  }
+                  buffer_index = 0;
+                  buffer_filled = 1; // O buffer está "cheio" com o novo valor de tara
                   scale_state = STATE_TRANSITION;
               }
           }
       }
       last_button_state = current_state;
 
-      // --- LÓGICA PRINCIPAL COM FILTRO ALPHA-BETA ---
-      if (HAL_GPIO_ReadPin(ADC_DOUT_GPIO_Port, ADC_DOUT_Pin) == GPIO_PIN_RESET)
-      {
-          raw_value = ADS1232_Read_Filtered();
-          
-          kalman_x += kalman_v;
-          float residual = (float)raw_value - kalman_x;
-          kalman_x += alpha * residual;
-          kalman_v += beta * residual;
+      // --- LEITURA E PREENCHIMENTO DO BUFFER ---
+      int32_t current_reading = ADS1232_Read_Median_of_3();
+      readings_buffer[buffer_index] = current_reading;
+      buffer_index = (buffer_index + 1) % FILT_WIN_SIZE;
+      if (!buffer_filled && buffer_index == 0) {
+          buffer_filled = 1;
+      }
+      
+      float current_avg_grams = 0;
+      uint8_t is_stable = 0;
+      float average_y = 0.0f;
 
-          // --- ATUALIZAÇÃO DA MÁQUINA DE ESTADOS ---
-          if (fabsf(kalman_v) > stability_slope_threshold) {
+      // --- CÁLCULO ESTATÍSTICO ---
+      if (buffer_filled) {
+          Calculate_Statistics(&average_y, &sigma_g, &slope_g);
+          current_avg_grams = ADS1232_ConvertToGrams((int32_t)average_y);
+          if (sigma_g < STABILITY_SIGMA_THRESHOLD && fabsf(slope_g) < STABILITY_SLOPE_THRESHOLD) {
+              is_stable = 1;
+          }
+      } else {
+          current_avg_grams = 0.0f;
+      }
+
+      // --- MÁQUINA DE ESTADOS COM HISTERESE ---
+      switch(scale_state)
+      {
+          case STATE_TRANSITION:
+              weight_in_grams = current_avg_grams;
+              if (is_stable) {
+                  scale_state = STATE_STABILIZING;
+                  stabilizing_start_time = HAL_GetTick();
+              }
+              break;
+          case STATE_STABILIZING:
+              weight_in_grams = current_avg_grams;
+              if (is_stable) {
+                  if (HAL_GetTick() - stabilizing_start_time > TIME_TO_LOCK_MS) {
+                      locked_weight_grams = current_avg_grams;
+                      scale_state = STATE_LOCKED;
+                  }
+              } else {
+                  scale_state = STATE_TRANSITION;
+              }
+              break;
+          case STATE_LOCKED:
+              weight_in_grams = locked_weight_grams;
+              if (fabsf(current_avg_grams - locked_weight_grams) > HYSTERESIS_GRAMS) {
+                  scale_state = STATE_TRANSITION;
+              }
+              break;
+      }
+      
+      // --- LÓGICA DE AUTO-ZERO SIMPLIFICADA ---
+      if (buffer_filled && abs((int32_t)average_y - absolute_zero_offset) < AUTO_ZERO_THRESHOLD_COUNTS) {
+          if (is_near_zero == 0) {
+              is_near_zero = 1;
+              near_zero_start_time = HAL_GetTick();
+          } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
+              // A condição 'is_stable' foi removida para evitar o ciclo vicioso
+              absolute_zero_offset = ADS1232_Tare();
+              weight_in_grams = 0.0f;
               scale_state = STATE_TRANSITION;
           }
-
-          switch(scale_state)
-          {
-              case STATE_TRANSITION:
-                  weight_in_grams = ADS1232_ConvertToGrams((int32_t)kalman_x);
-                  if (fabsf(kalman_v) <= stability_slope_threshold) {
-                      scale_state = STATE_STABILIZING;
-                      stabilizing_start_time = HAL_GetTick();
-                  }
-                  break;
-              case STATE_STABILIZING:
-                  weight_in_grams = ADS1232_ConvertToGrams((int32_t)kalman_x);
-                  if (HAL_GetTick() - stabilizing_start_time > time_to_lock_ms) {
-                      locked_weight_grams = weight_in_grams;
-                      if (fabsf(locked_weight_grams) > 0.01f){
-                         scale_state = STATE_LOCKED;
-                      }
-                  }
-                  break;
-              case STATE_LOCKED:
-                  weight_in_grams = locked_weight_grams;
-                  break;
-          }
-          
-          // --- LÓGICA DE AUTO-ZERO E AJUSTE FINAL DO DISPLAY ---
-          int32_t filtered_raw_value = (int32_t)kalman_x;
-          if (abs(filtered_raw_value - absolute_zero_offset) < AUTO_ZERO_THRESHOLD_COUNTS) {
-              if (is_near_zero == 0) {
-                  is_near_zero = 1;
-                  near_zero_start_time = HAL_GetTick();
-              } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
-                  ADS1232_SetOffset(filtered_raw_value); 
-                  absolute_zero_offset = filtered_raw_value; 
-                  scale_state = STATE_TRANSITION; 
-                  near_zero_start_time = HAL_GetTick();
-              }
-              
-              if(scale_state != STATE_LOCKED) {
-                  weight_in_grams = 0.0f;
-              }
-          } else {
-              is_near_zero = 0;
-          }
-          
-          printf("Peso: %.3f | Velocidade: %.2f\r\n", weight_in_grams, kalman_v);
-          
-          int32_t weight_for_dwin = (int32_t)(weight_in_grams * 1000.0f);
-          DWIN_SendData(0x2000, weight_for_dwin);
-          
-          HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
+      } else {
+          is_near_zero = 0;
       }
+      if (is_near_zero && scale_state != STATE_LOCKED) {
+          weight_in_grams = 0.0f;
+      }
+      
+      // --- CONTROLE DE VELOCIDADE DO PRINTF ---
+      static uint32_t last_print_time = 0;
+      if (HAL_GetTick() - last_print_time > 100) { 
+          printf("Peso: %.3f | Sigma: %.2f | Slope: %.2f\r\n", weight_in_grams, sigma_g, slope_g);
+          DWIN_SendData(0x2000, (int32_t)(weight_in_grams * 1000.0f));
+          last_print_time = HAL_GetTick();
+      }
+      HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
+    /* USER CODE END 3 */
   }
-  /* USER CODE END 3 */
 }
+
+// ... (Resto do ficheiro main.c, incluindo Calculate_Statistics, permanece igual) ...
 
 /**
   * @brief System Clock Configuration
@@ -255,6 +281,31 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void Calculate_Statistics(float* p_avg_y, float* p_sigma, float* p_slope)
+{
+    long long sum_y = 0;
+    long long sum_xy = 0;
+    float sum_sq_diff = 0;
+    
+    for (int i = 0; i < FILT_WIN_SIZE; i++) {
+        sum_y += readings_buffer[i];
+        sum_xy += (long long)i * readings_buffer[(buffer_index + i) % FILT_WIN_SIZE];
+    }
+    *p_avg_y = (float)sum_y / FILT_WIN_SIZE;
+
+    for (int i = 0; i < FILT_WIN_SIZE; i++) {
+        float diff = (float)readings_buffer[i] - (*p_avg_y);
+        sum_sq_diff += diff * diff;
+    }
+    
+    *p_sigma = sqrtf(sum_sq_diff / FILT_WIN_SIZE);
+    
+    if (regression_denominator != 0.0f) {
+        *p_slope = ((float)((long long)FILT_WIN_SIZE * sum_xy - sum_x * sum_y)) / regression_denominator;
+    } else {
+        *p_slope = 0.0f;
+    }
+}
 /* USER CODE END 4 */
 
 /**
