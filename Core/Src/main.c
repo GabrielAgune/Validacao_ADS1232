@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body (v11.1 - Correção do Loop de Auto-Zero)
+  * @brief          : Main program body (v9.1 - Refatorado para Evitar Bug do Compilador)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -17,13 +17,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
 typedef enum {
-    STATE_TRANSITION,
+    STATE_TRANSITION = 0,
     STATE_STABILIZING,
     STATE_LOCKED
 } ScaleState_t;
@@ -31,26 +29,32 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define FILT_WIN_SIZE 32
+#define FILT_WIN_SIZE 64
 
-const float STABILITY_SLOPE_THRESHOLD = 8.0f;     
-const float STABILITY_SIGMA_THRESHOLD = 40.0f; 
-const uint32_t TIME_TO_LOCK_MS = 1000;         
+const float STABILITY_SLOPE_THRESHOLD = 0.003f;     
+const float STABILITY_SIGMA_THRESHOLD = 0.020f;    
+const uint32_t TIME_TO_LOCK_MS = 1200;         
 
 const float HYSTERESIS_GRAMS = 0.05f; 
 /* USER CODE END PD */
 
+const uint32_t AUTO_ZERO_COOLDOWN_MS  = 15000;  // período refratário após qualquer tara
+
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+const float    STEP_DETECT_THRESHOLD_G = 0.30f;   // detecta passo > 0,3 g
+const uint32_t STEP_GUARD_MS           = 400;  
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
+/* USER CODE BEGIN PV */
 int32_t readings_buffer[FILT_WIN_SIZE] = {0};
 int buffer_index = 0;
-uint8_t buffer_filled = 0;
+int buffer_filled = 0;
 
+long long sum_y = 0;
+long long sum_y_sq = 0;
+long long sum_xy = 0;
 long long sum_x = 0;
 long long sum_x_sq = 0;
 float regression_denominator = 0.0f;
@@ -58,11 +62,16 @@ float regression_denominator = 0.0f;
 ScaleState_t scale_state = STATE_TRANSITION;
 float locked_weight_grams = 0.0f;
 uint32_t stabilizing_start_time = 0;
+uint32_t step_guard_until = 0;
 
 int32_t absolute_zero_offset = 0;
+
 const int32_t AUTO_ZERO_THRESHOLD_COUNTS = 1500;
+const float   AUTO_ZERO_THRESHOLD_GRAMS  = 0.020f;
+
 const uint32_t auto_zero_time_ms = 3000;
 uint32_t near_zero_start_time = 0;
+uint32_t last_tare_time = 0;
 uint8_t is_near_zero = 0;
 
 /* USER CODE BEGIN PV */
@@ -74,7 +83,10 @@ float slope_g = 0.0f;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void DWIN_SendData(uint16_t vp_address, int32_t value);
-void Calculate_Statistics(float* p_avg_y, float* p_sigma, float* p_slope);
+// --- Nova função auxiliar para os cálculos ---
+static void Calculate_Statistics_Counts(float* p_avg_y, float* p_sigma_counts, float* p_slope_counts);
+
+static float CountsToGramsGain(int32_t raw_counts);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -99,6 +111,67 @@ void DWIN_SendData(uint16_t vp_address, int32_t value)
     HAL_UART_Transmit(&huart1, dwin_frame, 10, 100);
 }
 
+static void Calculate_Statistics_Counts(float* p_avg_y, float* p_sigma_counts, float* p_slope_counts)
+{
+    float average_y = 0.0f;
+    *p_avg_y = 0.0f; 
+    *p_sigma_counts = 0.0f; 
+    *p_slope_counts = 0.0f; 
+
+    if (buffer_filled) {
+        long long sum = 0;
+        for (int i = 0; i < FILT_WIN_SIZE; i++) {
+            sum += readings_buffer[i];
+        }
+        average_y = (float)((double)sum / (double)FILT_WIN_SIZE);
+
+        long long sum_sq_diff = 0;
+        for (int i = 0; i < FILT_WIN_SIZE; i++) {
+            long long diff = readings_buffer[i] - (long long)average_y;
+            sum_sq_diff += diff * diff;
+        }
+        float sigma_counts = sqrtf((float)((double)sum_sq_diff / (double)FILT_WIN_SIZE));
+
+        long long sum_xy_local = 0;
+        long long sum_x_local = 0;
+        long long sum_y_local = 0;
+        long long sum_x_sq_local = 0;
+
+        for (int i = 0; i < FILT_WIN_SIZE; i++) {
+            sum_xy_local += i * readings_buffer[i];
+            sum_x_local  += i;
+            sum_y_local  += readings_buffer[i];
+            sum_x_sq_local += i * i;
+        }
+
+        long long N = FILT_WIN_SIZE;
+        long long numerator = (N * sum_xy_local - sum_x_local * sum_y_local);
+        long long denominator = (N * sum_x_sq_local - sum_x_local * sum_x_local);
+
+        float slope_counts = 0.0f;
+        if (denominator != 0) {
+            slope_counts = (float)((double)numerator / (double)denominator);
+        }
+
+        *p_avg_y = average_y;
+        *p_sigma_counts = sigma_counts;
+        *p_slope_counts = slope_counts;
+    }
+}
+
+static float CountsToGramsGain(int32_t raw_counts)
+{
+    /* Usa sua função de conversão, sem acessar a tabela diretamente */
+    float g1 = ADS1232_ConvertToGrams(raw_counts);
+    float g2 = ADS1232_ConvertToGrams(raw_counts + 64); // passo pequeno
+    float dg = g2 - g1;
+    if (dg <= 0.0f) {
+        /* fallback razoável próximo da sua calibração (~6200 counts/g) */
+        return 1.0f / 6200.0f;
+    }
+    return dg / 64.0f;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -107,40 +180,40 @@ void DWIN_SendData(uint16_t vp_address, int32_t value)
   */
 int main(void)
 {
-  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
+
   SystemClock_Config();
+
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
-  /* USER CODE BEGIN 2 */
 
-  GPIO_PinState button_state = GPIO_PIN_SET;
-  GPIO_PinState last_button_state = GPIO_PIN_SET;
-  uint32_t last_debounce_time = 0;
-	
   printf("\r\n--- Balanca de Precisao com ADS1232 e Display DWIN ---\r\n");
 
   ADS1232_Init();
-  
+  HAL_Delay(100);
+
   absolute_zero_offset = ADS1232_Tare();
-  
-  for(int i = 0; i < FILT_WIN_SIZE; i++) {
+  for (int i = 0; i < FILT_WIN_SIZE; i++) {
       readings_buffer[i] = absolute_zero_offset;
   }
 	
-  for(int i = 0; i < FILT_WIN_SIZE; i++) {
-      sum_x += i;
-      sum_x_sq += (long long)i * i;
-  }
-  regression_denominator = (float)((long long)FILT_WIN_SIZE * sum_x_sq - (sum_x * sum_x));
-	
+  buffer_index = 0;
+  buffer_filled = 1;
+  is_near_zero = 0;
+  near_zero_start_time = HAL_GetTick();
+  last_tare_time = HAL_GetTick();
+
   printf("\r\nSistema pronto. Balanca vazia e tarada.\r\n");
-  
   printf("Driver DWIN Inicializado na USART1.\r\n");
-	
-  float weight_in_grams;
-  /* USER CODE END 2 */
+
+  GPIO_PinState button_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
+  GPIO_PinState last_button_state = button_state;
+  uint32_t last_debounce_time = HAL_GetTick();
+
+  float weight_in_grams = 0.0f;
+	float prev_avg_for_step = 0.0f;
+  uint8_t first_avg = 1;
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -156,12 +229,17 @@ int main(void)
               button_state = current_state;
               if (button_state == GPIO_PIN_RESET) {
                   absolute_zero_offset = ADS1232_Tare();
-                  for(int i = 0; i < FILT_WIN_SIZE; i++) {
+                  scale_state = STATE_TRANSITION;
+                  for (int i = 0; i < FILT_WIN_SIZE; i++) {
                       readings_buffer[i] = absolute_zero_offset;
                   }
-                  buffer_index = 0;
+                  buffer_index  = 0;
                   buffer_filled = 1;
-                  scale_state = STATE_TRANSITION;
+                  weight_in_grams = 0.0f;
+                  is_near_zero = 0;
+                  near_zero_start_time = HAL_GetTick();
+                  last_tare_time = HAL_GetTick();
+                  step_guard_until = HAL_GetTick(); // reseta proteção
               }
           }
       }
@@ -175,14 +253,22 @@ int main(void)
           buffer_filled = 1;
       }
       
-      float current_avg_grams = 0;
-      uint8_t is_stable = 0;
-      float average_y = 0.0f;
+      float average_y_counts = 0.0f;
+      float sigma_counts = 0.0f;
+      float slope_counts = 0.0f;
 
-      // --- CÁLCULO ESTATÍSTICO ---
+      float current_avg_grams = 0.0f;
+      uint8_t is_stable = 0;
+
       if (buffer_filled) {
-          Calculate_Statistics(&average_y, &sigma_g, &slope_g);
-          current_avg_grams = ADS1232_ConvertToGrams((int32_t)average_y);
+          Calculate_Statistics_Counts(&average_y_counts, &sigma_counts, &slope_counts);
+
+          /* Converte média/sigma/slope para GRAMAS usando ganho local */
+          float gpc = CountsToGramsGain((int32_t)average_y_counts); // g per count
+          current_avg_grams = ADS1232_ConvertToGrams((int32_t)average_y_counts);
+          sigma_g = sigma_counts * gpc;
+          slope_g = slope_counts * gpc;
+					
           if (sigma_g < STABILITY_SIGMA_THRESHOLD && fabsf(slope_g) < STABILITY_SLOPE_THRESHOLD) {
               is_stable = 1;
           }
@@ -190,19 +276,36 @@ int main(void)
           current_avg_grams = 0.0f;
       }
 
+			/* --- DETECÇÃO DE DEGRAU (inserção/retirada de peso) --- */
+      if (buffer_filled) {
+          if (first_avg) {
+              prev_avg_for_step = current_avg_grams;
+              first_avg = 0;
+          }
+          float step_delta = fabsf(current_avg_grams - prev_avg_for_step);
+          if (step_delta > STEP_DETECT_THRESHOLD_G) {
+              /* houve degrau: volta pra TRANSITION e abre guarda p/ anelamento */
+              scale_state = STATE_TRANSITION;
+              step_guard_until = HAL_GetTick() + STEP_GUARD_MS;
+          }
+          prev_avg_for_step = current_avg_grams;
+      }
+
+
       // --- MÁQUINA DE ESTADOS COM HISTERESE ---
       switch(scale_state)
       {
           case STATE_TRANSITION:
               weight_in_grams = current_avg_grams;
-              if (is_stable) {
+              if (is_stable && (HAL_GetTick() > step_guard_until)) {
                   scale_state = STATE_STABILIZING;
                   stabilizing_start_time = HAL_GetTick();
               }
               break;
+
           case STATE_STABILIZING:
               weight_in_grams = current_avg_grams;
-              if (is_stable) {
+              if (is_stable && (HAL_GetTick() > step_guard_until)) {
                   if (HAL_GetTick() - stabilizing_start_time > TIME_TO_LOCK_MS) {
                       locked_weight_grams = current_avg_grams;
                       scale_state = STATE_LOCKED;
@@ -211,6 +314,7 @@ int main(void)
                   scale_state = STATE_TRANSITION;
               }
               break;
+
           case STATE_LOCKED:
               weight_in_grams = locked_weight_grams;
               if (fabsf(current_avg_grams - locked_weight_grams) > HYSTERESIS_GRAMS) {
@@ -219,16 +323,25 @@ int main(void)
               break;
       }
       
-      // --- LÓGICA DE AUTO-ZERO CORRIGIDA ---
-      if (buffer_filled && abs((int32_t)average_y - absolute_zero_offset) < AUTO_ZERO_THRESHOLD_COUNTS) {
+      /* --- AUTO-ZERO: usa limiar em gramas + estabilidade + cooldown --- */
+      uint8_t cooldown_ok = (HAL_GetTick() - last_tare_time) > AUTO_ZERO_COOLDOWN_MS;
+      if (cooldown_ok && buffer_filled && fabsf(current_avg_grams) < AUTO_ZERO_THRESHOLD_GRAMS) {
           if (is_near_zero == 0) {
               is_near_zero = 1;
               near_zero_start_time = HAL_GetTick();
-          } else if (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms) {
+          } else if (is_stable && (HAL_GetTick() - near_zero_start_time > auto_zero_time_ms)) {
               absolute_zero_offset = ADS1232_Tare();
+              for (int i = 0; i < FILT_WIN_SIZE; i++) {
+                  readings_buffer[i] = absolute_zero_offset;
+              }
+              buffer_index  = 0;
+              buffer_filled = 1;
               weight_in_grams = 0.0f;
               scale_state = STATE_TRANSITION;
-              near_zero_start_time = HAL_GetTick(); // <<<<<< CORREÇÃO CRÍTICA: REINICIA O TEMPORIZADOR
+              is_near_zero = 0;
+              near_zero_start_time = HAL_GetTick();
+              last_tare_time = HAL_GetTick();
+              step_guard_until = HAL_GetTick();
           }
       } else {
           is_near_zero = 0;
@@ -244,12 +357,13 @@ int main(void)
           DWIN_SendData(0x2000, (int32_t)(weight_in_grams * 1000.0f));
           last_print_time = HAL_GetTick();
       }
-      HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
-    /* USER CODE END 3 */
-  }
-}
 
-// ... (Resto do ficheiro main.c, incluindo Calculate_Statistics, permanece igual) ...
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
 
 /**
   * @brief System Clock Configuration
@@ -281,57 +395,16 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void Calculate_Statistics(float* p_avg_y, float* p_sigma, float* p_slope)
-{
-    long long sum_y = 0;
-    long long sum_xy = 0;
-    float sum_sq_diff = 0;
-    
-    for (int i = 0; i < FILT_WIN_SIZE; i++) {
-        sum_y += readings_buffer[i];
-        sum_xy += (long long)i * readings_buffer[(buffer_index + i) % FILT_WIN_SIZE];
-    }
-    *p_avg_y = (float)sum_y / FILT_WIN_SIZE;
-
-    for (int i = 0; i < FILT_WIN_SIZE; i++) {
-        float diff = (float)readings_buffer[i] - (*p_avg_y);
-        sum_sq_diff += diff * diff;
-    }
-    
-    *p_sigma = sqrtf(sum_sq_diff / FILT_WIN_SIZE);
-    
-    if (regression_denominator != 0.0f) {
-        *p_slope = ((float)((long long)FILT_WIN_SIZE * sum_xy - sum_x * sum_y)) / regression_denominator;
-    } else {
-        *p_slope = 0.0f;
-    }
-}
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
   while (1)
   {
-      HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin);
-      HAL_Delay(200);
   }
-  /* USER CODE END Error_Handler_Debug */
 }
+/* USER CODE END 4 */
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  * where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */

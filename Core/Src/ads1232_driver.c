@@ -2,6 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+
+static int32_t cal_zero_adc = 0; // ADC do ponto de 0 g da TABELA de calibração
+
 // --- DEFINIÇÃO DA TABELA DE CALIBRAÇÃO ---
 // Os valores de adc_value devem ser preenchidos por você com a rotina de calibração
 CalPoint_t cal_points[NUM_CAL_POINTS] = {
@@ -31,6 +34,7 @@ void ADS1232_Init(void) {
     HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_RESET);
     HAL_Delay(1); 
     HAL_GPIO_WritePin(ADC_PDWN_GPIO_Port, ADC_PDWN_Pin, GPIO_PIN_SET);
+		cal_zero_adc = cal_points[0].adc_value;
 }
 
 int32_t ADS1232_Read(void) {
@@ -69,8 +73,8 @@ int32_t ADS1232_Read_Median_of_3(void) {
 
 int32_t ADS1232_Tare(void) { 
     printf("Tarando... Aguarde estabilidade.\r\n");
-    const int num_samples = 20;
-    const int32_t stability_threshold = 500;
+    const int num_samples = 32;
+    const int32_t stability_threshold = 300;
     int max_retries = 10;
     
     for (int retry = 0; retry < max_retries; retry++) {
@@ -84,9 +88,7 @@ int32_t ADS1232_Tare(void) {
             HAL_Delay(10);
         }
         if ((max_val - min_val) < stability_threshold) {
-            adc_offset = sum / num_samples;
-            // Atualiza o ponto zero na tabela de calibração
-            cal_points[0].adc_value = adc_offset; 
+            adc_offset = (int32_t)(sum / num_samples);
             printf("Tara estavel concluida! Offset = %d\r\n", (int)adc_offset);
             return adc_offset; 
         }
@@ -96,32 +98,48 @@ int32_t ADS1232_Tare(void) {
     return adc_offset; // Retorna o offset antigo se falhar
 }
 
-float ADS1232_ConvertToGrams(int32_t raw_value) {
-    // A extrapolação para valores abaixo de 0g é feita com o primeiro segmento (0-50g)
-    if (raw_value < cal_points[0].adc_value) {
-        float factor = (cal_points[1].grams - cal_points[0].grams) / 
-                       (float)(cal_points[1].adc_value - cal_points[0].adc_value);
-        return (float)(raw_value - cal_points[0].adc_value) * factor;
-    }
+float ADS1232_ConvertToGrams(int32_t raw_value)
+{
+    // 1) Leitura líquida: remove a tara medida (adc_offset)
+    // 2) Reancora na curva de calibração somando o ADC de 0 g da tabela
+    //    => efetivamente "move" a leitura atual para o mesmo referencial da calibração
+    int32_t eff_adc = (raw_value - adc_offset) + cal_zero_adc;
 
-    // Procura o segmento correto para interpolação
+    // 3) Interpolação linear no segmento correspondente
     for (int i = 0; i < NUM_CAL_POINTS - 1; i++) {
-        if (raw_value <= cal_points[i+1].adc_value) {
-            float adc_range = (float)(cal_points[i+1].adc_value - cal_points[i].adc_value);
-            if (adc_range == 0) return cal_points[i].grams;
-
-            float gram_range = cal_points[i+1].grams - cal_points[i].grams;
-            float ratio = (float)(raw_value - cal_points[i].adc_value) / adc_range;
-            return cal_points[i].grams + (ratio * gram_range);
+        int32_t x1 = cal_points[i].adc_value;
+        int32_t x2 = cal_points[i+1].adc_value;
+        if (eff_adc >= x1 && eff_adc <= x2) {
+            float y1 = cal_points[i].grams;
+            float y2 = cal_points[i+1].grams;
+            float dx = (float)(x2 - x1);
+            if (dx == 0.0f) return y1;
+            float m  = (y2 - y1) / dx;              // g / count
+            return y1 + m * (eff_adc - x1);
         }
     }
 
-    // A extrapolação para valores acima do último ponto é feita com o último segmento
-    int last = NUM_CAL_POINTS - 1;
-    int second_last = NUM_CAL_POINTS - 2;
-    float factor = (cal_points[last].grams - cal_points[second_last].grams) / 
-                   (float)(cal_points[last].adc_value - cal_points[second_last].adc_value);
-    return cal_points[last].grams + ((float)(raw_value - cal_points[last].adc_value) * factor);
+    // 4) Extrapolação linear (para cima e para baixo) com os extremos CORRETAMENTE
+    if (NUM_CAL_POINTS >= 2) {
+        // abaixo do menor ponto
+        if (eff_adc < cal_points[0].adc_value) {
+            int32_t x1 = cal_points[0].adc_value;
+            int32_t x2 = cal_points[1].adc_value;
+            float   y1 = cal_points[0].grams;
+            float   y2 = cal_points[1].grams;
+            float   m  = (y2 - y1) / (float)(x2 - x1);
+            return y1 + m * (eff_adc - x1);
+        }
+        // acima do maior ponto
+        int32_t x1 = cal_points[NUM_CAL_POINTS - 2].adc_value;
+        int32_t x2 = cal_points[NUM_CAL_POINTS - 1].adc_value;
+        float   y1 = cal_points[NUM_CAL_POINTS - 2].grams;
+        float   y2 = cal_points[NUM_CAL_POINTS - 1].grams;
+        float   m  = (y2 - y1) / (float)(x2 - x1);
+        return y2 + m * (eff_adc - x2); 
+    }
+
+    return 0.0f;
 }
 
 int32_t ADS1232_GetOffset(void) {
@@ -130,5 +148,4 @@ int32_t ADS1232_GetOffset(void) {
 
 void ADS1232_SetOffset(int32_t new_offset) {
     adc_offset = new_offset;
-    cal_points[0].adc_value = new_offset; // Garante que o ponto zero está sempre atualizado
 }
