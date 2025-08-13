@@ -151,3 +151,22 @@ int32_t ADS1232_GetOffset(void) {
 void ADS1232_SetOffset(int32_t new_offset) {
     adc_offset = new_offset;
 }
+
+/**
+ * @brief Lê múltiplas amostras do ADS1232 (no modo 80SPS) e retorna a sua média.
+ * @note Esta função chama a função ADS1232_Read() internamente.
+ * @retval A média filtrada das leituras do ADC.
+ */
+int32_t ADS1232_Read_Filtered(void)
+{
+    // Vamos tirar a média de 8 amostras. 
+    // Como estamos a 80SPS, isto nos dará uma leitura estável a cada 100ms (10 leituras por segundo).
+    const int num_samples_to_average = 8;
+    int64_t sum_of_samples = 0; // Usamos 64 bits para evitar overflow na soma
+
+    for (int i = 0; i < num_samples_to_average; i++) {
+        sum_of_samples += ADS1232_Read(); // Chama a sua função de leitura original
+    }
+
+    return (int32_t)(sum_of_samples / num_samples_to_average);
+}

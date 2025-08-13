@@ -28,6 +28,12 @@ int32_t ADS1232_Read(void);
 void ADS1232_SetCalibrationFactor(float factor);
 
 /**
+ * @brief Lê múltiplas amostras do ADS1232 (no modo 80SPS) e retorna a sua média.
+ * @retval A média filtrada das leituras do ADC.
+ */
+int32_t ADS1232_Read_Filtered(void); 
+
+/**
   * @brief Converte o valor raw atual em gramas.
   * @retval O peso calculado em gramas.
   */
